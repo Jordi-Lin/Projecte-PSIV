@@ -5,21 +5,29 @@ import json
 import numpy as np
 
 # ---------------- CONFIGURACIÓ ----------------
-# Ruta de les imatges d'entrenament a la subcarpeta Datasets/IIIT5K/train
-PATH = os.path.join(os.getcwd(), 'Datasets', 'IIIT5K', 'train')
 # Fitxer JSON amb rutes relatives d'imatges a processar
-JSON_PATH = os.path.join(os.getcwd(), 'paths_imagenes_faciles.json')
+dataset = int(input("1: IIIT5K o 2: EMNIST: "))
+if dataset == 1:
+    PATH = os.path.join(os.getcwd(), 'Datasets', 'IIIT5K', 'train')
+    JSON_PATH = os.path.join(os.getcwd(), 'IIIT5K.json')
+elif dataset == 2:
+    PATH = os.path.join(os.getcwd(), 'Datasets', 'EMNIST', 'train')
+    JSON_PATH = os.path.join(os.getcwd(), 'EMNIST.json')
 # Directori on es guardaran les imatges de sortida
 OUTPUT_DIR = os.path.join(os.getcwd(), 'resultats_segmentacio')
-
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+MATRICES_DIR = os.path.join(OUTPUT_DIR, 'matrius')
+os.makedirs(MATRICES_DIR, exist_ok=True)
 
+# Carreguem les rutes de les imatges a processar des del JSON
 try:
     with open(JSON_PATH, 'r') as f:
         paths = json.load(f)
 except FileNotFoundError:
     print(f"Error: No se encontró el archivo {JSON_PATH}")
     paths = []
+
+dividir = dataset == 1  # Només dividim en caràcters per IIIT5K, ja que EMNIST ja són caràcters individuals
 
 
 # ---------------- FUNCIONS AUXILIARS ----------------
@@ -111,7 +119,7 @@ def filter_text_components(binary_img):
 
     # Llindars dependents de la mida de la imatge
     min_area = max(4, int(0.0002 * H * W))
-    min_height = max(3, int(0.10 * H))
+    min_height = max(3, int(0.12 * H))
     max_height = int(0.98 * H)
 
     for i in range(1, num_labels):
@@ -163,7 +171,7 @@ def get_word_crop(original_rgb, mask, padding=5):
     coords = cv2.findNonZero(mask)
 
     if coords is None:
-        return None, original_rgb.copy(), None
+        return None, None, original_rgb.copy(), None
 
     x, y, w, h = cv2.boundingRect(coords)
 
@@ -172,18 +180,13 @@ def get_word_crop(original_rgb, mask, padding=5):
     x2 = min(x + w + padding, W)
     y2 = min(y + h + padding, H)
 
-    crop = original_rgb[y1:y2, x1:x2]
+    crop_rgb = original_rgb[y1:y2, x1:x2]
+    crop_mask = mask[y1:y2, x1:x2]
 
     boxed = original_rgb.copy()
-    cv2.rectangle(
-        boxed,
-        (x1, y1),
-        (x2, y2),
-        (255, 0, 0),
-        1
-    )
+    cv2.rectangle(boxed, (x1, y1), (x2, y2), (255, 0, 0), 1)
 
-    return crop, boxed, (x1, y1, x2, y2)
+    return crop_rgb, crop_mask, boxed, (x1, y1, x2, y2)
 
 
 def overlay_edges_on_crop(crop_rgb, edges):
@@ -204,9 +207,209 @@ def overlay_edges_on_crop(crop_rgb, edges):
     return overlay
 
 
+def segment_letters_as_canny_matrices(word_crop_rgb, edges_crop, edges_overlay, output_dir, matrices_dir, image_index, output_size=32, padding=3):
+    """
+    Segmenta lletres utilitzant només els píxels detectats per Canny.
+
+    Retorna:
+    - letter_matrices: matrius binàries 32x32, una per lletra
+    - letter_boxes: bounding boxes de cada lletra
+    - debug_img: imatge amb caixes dibuixades
+    - connected_edges: vores connectades
+    """
+
+    H, W = edges_crop.shape
+
+    # --- 1. Convertir Canny a binari ---
+    canny_bin = (edges_crop > 0).astype(np.uint8) * 255
+
+    # Eliminar vores externes del crop
+    border = max(1, W // 100)
+    canny_bin[:, :border] = 0
+    canny_bin[:, -border:] = 0
+    canny_bin[:border, :] = 0
+    canny_bin[-border:, :] = 0
+
+    # --- 2. Connectar fragments propers de la mateixa lletra ---
+    # Kernel en creu: connecta parts properes sense unir tant horitzontalment
+    kernel = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
+
+    connected_edges = cv2.dilate(canny_bin, kernel, iterations=1)
+
+    connected_edges = cv2.morphologyEx(connected_edges, cv2.MORPH_CLOSE, kernel)
+
+    # --- 3. Components connectats sobre Canny ---
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(connected_edges, connectivity=8)
+
+    components = []
+
+    min_area = max(3, int(0.0001 * H * W))  # Àrea mínima depenent de la mida del crop
+    min_height = max(3, int(0.08 * H))  # Altura mínima depenent de la mida del crop
+
+    for i in range(1, num_labels):
+        x = stats[i, cv2.CC_STAT_LEFT]
+        y = stats[i, cv2.CC_STAT_TOP]
+        w = stats[i, cv2.CC_STAT_WIDTH]
+        h = stats[i, cv2.CC_STAT_HEIGHT]
+        area = stats[i, cv2.CC_STAT_AREA]
+
+        if area < min_area:
+            continue
+
+        if h < min_height:
+            continue
+
+        # Evitar línies horitzontals molt llargues
+        if w > 0.85 * W and h < 0.25 * H:
+            continue
+
+        components.append({"label": i, "box": [x, y, x + w, y + h], "area": area})
+
+    components = sorted(components, key=lambda c: c["box"][0])
+
+    # --- 4. Agrupar fragments que pertanyen a la mateixa lletra ---
+    groups = []
+
+    def x_overlap_ratio(box_a, box_b):
+        ax1, ay1, ax2, ay2 = box_a
+        bx1, by1, bx2, by2 = box_b
+
+        overlap = max(0, min(ax2, bx2) - max(ax1, bx1))
+        min_width = min(ax2 - ax1, bx2 - bx1)
+
+        if min_width <= 0:
+            return 0
+
+        return overlap / float(min_width)
+
+    def union_box(box_a, box_b):
+        ax1, ay1, ax2, ay2 = box_a
+        bx1, by1, bx2, by2 = box_b
+
+        return [min(ax1, bx1), min(ay1, by1), max(ax2, bx2), max(ay2, by2)]
+
+    for comp in components:
+        comp_box = comp["box"]
+        assigned = False
+
+        for group in groups:
+            group_box = group["box"]
+
+            overlap_x = x_overlap_ratio(comp_box, group_box)
+
+            comp_cx = (comp_box[0] + comp_box[2]) / 2
+            group_cx = (group_box[0] + group_box[2]) / 2
+
+            group_width = group_box[2] - group_box[0]
+
+            same_letter_by_overlap = overlap_x > 0.25
+            same_letter_by_center = abs(comp_cx - group_cx) < 0.35 * max(group_width, 1)
+
+            if same_letter_by_overlap or same_letter_by_center:
+                group["labels"].append(comp["label"])
+                group["box"] = union_box(group_box, comp_box)
+                assigned = True
+                break
+
+        if not assigned:
+            groups.append({"labels": [comp["label"]], "box": comp_box})
+
+    # Ordenar grups d'esquerra a dreta
+    groups = sorted(groups, key=lambda g: g["box"][0])
+
+    # --- 5. Construir una matriu per cada lletra ---
+    letter_matrices = []
+    letter_boxes = []
+
+    debug_img = word_crop_rgb.copy()
+
+    for idx, group in enumerate(groups):
+        group_mask = np.zeros_like(edges_crop)
+
+        for label_id in group["labels"]:
+            group_mask[labels == label_id] = 255
+
+        coords = cv2.findNonZero(group_mask)
+
+        if coords is None:
+            continue
+
+        x, y, w, h = cv2.boundingRect(coords)
+
+        x1 = max(x - padding, 0)
+        y1 = max(y - padding, 0)
+        x2 = min(x + w + padding, W)
+        y2 = min(y + h + padding, H)
+
+        if x2 - x1 < 4 or y2 - y1 < 4:
+            continue
+
+        # Matriu binària de la lletra
+        letter_mask = group_mask[y1:y2, x1:x2]
+
+        letter_matrix = cv2.resize(letter_mask, (output_size, output_size), interpolation=cv2.INTER_NEAREST)
+
+        letter_matrix = (letter_matrix > 0).astype(np.uint8)
+
+        letter_matrices.append(letter_matrix)
+        letter_boxes.append((x1, y1, x2, y2))
+
+        # Crop amb Canny pintat
+        letter_overlay = edges_overlay[y1:y2, x1:x2]
+
+        cv2.imwrite(os.path.join(output_dir, f'img_{image_index}_letter_{idx}_canny.png'), cv2.cvtColor(letter_overlay, cv2.COLOR_RGB2BGR))
+
+        # Guardar la matriu com imatge
+        cv2.imwrite(os.path.join(MATRICES_DIR, f'img_{image_index}_letter_{idx}_matrix.png'), letter_matrix * 255)
+
+        # Guardar la matriu real com .npy
+        np.save(os.path.join(MATRICES_DIR, f'img_{image_index}_letter_{idx}_matrix.npy'), letter_matrix)
+
+        cv2.rectangle(debug_img, (x1, y1), (x2, y2), (0, 255, 0), 1)
+
+    return letter_matrices, letter_boxes, debug_img, connected_edges
+
+
+def save_single_character_canny_matrix(edges_crop, matrices_dir, character, image_index, output_size=32):
+    letter_matrix = cv2.resize(
+        edges_crop,
+        (output_size, output_size),
+        interpolation=cv2.INTER_NEAREST
+    )
+
+    letter_matrix = (letter_matrix > 0).astype(np.uint8)
+
+    filename_base = f'{character}_img_{image_index}_matrix'
+
+    cv2.imwrite(
+        os.path.join(matrices_dir, f'{filename_base}.png'),
+        letter_matrix * 255
+    )
+
+    np.save(
+        os.path.join(matrices_dir, f'{filename_base}.npy'),
+        letter_matrix
+    )
+
+    return letter_matrix
+
+
 # ---------------- PIPELINE PRINCIPAL ----------------
 
-for j in range(min(10, len(paths))):
+#for j in range(min(5, len(paths))):
+total_images = 0
+
+for root, dirs, files in os.walk(PATH):
+    image_files = [
+        f for f in files
+        if f.lower().endswith(('.png', '.jpg', '.jpeg'))
+    ]
+
+    total_images += len(image_files)
+
+print(f"Total d'imatges: {total_images}")
+
+for j in range(total_images):
     image_path = os.path.join(PATH, paths[j])
 
     try:
@@ -254,7 +457,15 @@ for j in range(min(10, len(paths))):
         img_final = img_filtered.copy()
 
         # --- 7. CROP DE PARAULA ---
-        word_crop, img_box, bbox = get_word_crop(img_rgb_big, img_final, padding=5)
+        if dataset == 1:
+            # Retallem les parts que no ens interessen en el cas de IIIT5K
+            word_crop, mask_crop, img_box, bbox = get_word_crop(img_rgb_big, img_final, padding=5)  # Utilitzem padding=5 per assegurar-nos que no retallem les vores de les lletres
+        else:
+            # Per EMNIST, assumim que cada imatge ja és un sol caràcter, així que no fem crop
+            word_crop = None
+            mask_crop = None
+            img_box = img_rgb_big.copy()
+            bbox = None
 
         # Comprovem si s'ha obtingut un crop vàlid; si no, utilitzem la imatge completa per a les següents etapes
         if word_crop is None:
@@ -267,47 +478,66 @@ for j in range(min(10, len(paths))):
         # --- 8. CANNY SOBRE EL CROP ORIGINAL ---
         edges_crop = get_canny_edges(crop_gray)
 
+        # Guardar matriu Canny en el cas EMNIST
+        if dataset == 2:
+            character = os.path.basename(os.path.dirname(paths[j]))
+            save_single_character_canny_matrix(edges_crop, MATRICES_DIR, character, j)
+
         # --- 9. OVERLAY CANNY SOBRE CROP ---
-        if word_crop:
+        if word_crop is not None:
             edges_overlay = overlay_edges_on_crop(word_crop, edges_crop)
         else:
             edges_overlay = overlay_edges_on_crop(img_rgb_big, edges_crop)
+        
+        # --- 10. SEGMENTACIÓ EN CARÀCTERS AMB PROJECCIÓ VERTICAL ---
+        if dividir:
+            v_proj = None
+            gaps = []
+            char_images = []
+            char_boxes = []
+            edges_connected = None
+            debug_canny_components = None
+            letter_matrices = []
+            letter_boxes = []
+            debug_letters = None
+            connected_edges = None
+
+            if word_crop is not None:
+                letter_matrices, letter_boxes, debug_letters, connected_edges = segment_letters_as_canny_matrices(word_crop, edges_crop, edges_overlay, OUTPUT_DIR, MATRICES_DIR, j)
 
 
         # --- Guardem el resultat i visualitzem ---
-        cv2.imwrite(os.path.join(OUTPUT_DIR, f'mascara_final_{j}.png'), img_final)
-        cv2.imwrite(os.path.join(OUTPUT_DIR, f'canny_lletres_{j}.png'), edges_crop)
+        plt.figure(figsize=(16, 8))
 
-        if word_crop is not None:
-            word_crop_bgr = cv2.cvtColor(word_crop, cv2.COLOR_RGB2BGR)
-            overlay_bgr = cv2.cvtColor(edges_overlay, cv2.COLOR_RGB2BGR)
-
-            cv2.imwrite(os.path.join(OUTPUT_DIR, f'crop_paraula_{j}.png'), word_crop_bgr)
-
-            cv2.imwrite(os.path.join(OUTPUT_DIR, f'vores_sobre_crop_{j}.png'), overlay_bgr)
-
-        plt.figure(figsize=(18, 10))
-
-        titles = ['Original escalada', 'CLAHE + GaussianBlur', 'Otsu invertit', 'Línies detectades', 'Sense línies', 'Màscara final', 'Crop paraula', 'Canny vores', 'Vores sobre crop']
-        images = [img_rgb_big, img_blur, img_bin, detected_lines, img_no_lines, img_final, crop_to_show, edges_crop, edges_overlay]
-
-        for i in range(9):
-            plt.subplot(3, 3, i + 1)
-
-            if i in [0, 6, 8]:
-                plt.imshow(images[i])
+        if dividir:
+            if debug_letters is not None:
+                divisio_caracters = debug_letters
             else:
+                raise ValueError("No s'ha pogut generar la imatge de divisió per caràcters (debug_letters és None)")
+
+        images = [img_rgb_big, img_final, edges_overlay]
+        titles = ['Original escalada', 'Màscara final', 'Canny + Crop']
+
+        if dividir:
+            images.append(divisio_caracters)
+            titles.append('Divisió per caràcters')
+
+        for i in range(len(images)):
+            plt.subplot(2, 2, i + 1)
+
+            if i == 1:
                 plt.imshow(images[i], cmap='gray')
+            else:
+                plt.imshow(images[i])
 
             plt.title(titles[i])
             plt.axis('off')
 
         plt.tight_layout()
-        plt.savefig(os.path.join(OUTPUT_DIR, f'comparativa_canny_{j}.png'), dpi=200)
+        plt.savefig(os.path.join(OUTPUT_DIR, f'Resultats_imatge{j}.png'), dpi=200)
         plt.close('all')
 
-        print(f"Processada imatge {j}: {paths[j]}")
-        print(f"Bounding box: {bbox}")
+        print(f"Imatge {j} processada")
 
     except Exception as e:
         print(f"Error en {j}: {e}")
