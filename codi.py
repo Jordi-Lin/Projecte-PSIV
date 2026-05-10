@@ -246,6 +246,7 @@ def segment_letters_as_canny_matrices(word_crop_rgb, edges_crop, edges_overlay, 
     min_area = max(3, int(0.0001 * H * W))  # Àrea mínima depenent de la mida del crop
     min_height = max(3, int(0.08 * H))  # Altura mínima depenent de la mida del crop
 
+    # Recorrem els components detectats i apliquem filtres per eliminar soroll i fragments no textuals
     for i in range(1, num_labels):
         x = stats[i, cv2.CC_STAT_LEFT]
         y = stats[i, cv2.CC_STAT_TOP]
@@ -271,6 +272,7 @@ def segment_letters_as_canny_matrices(word_crop_rgb, edges_crop, edges_overlay, 
     groups = []
 
     def x_overlap_ratio(box_a, box_b):
+        """Calcula la proporció d'solapament horitzontal entre dues caixes, normalitzada pel mínim ample de les dues caixes."""
         ax1, ay1, ax2, ay2 = box_a
         bx1, by1, bx2, by2 = box_b
 
@@ -283,6 +285,7 @@ def segment_letters_as_canny_matrices(word_crop_rgb, edges_crop, edges_overlay, 
         return overlap / float(min_width)
 
     def union_box(box_a, box_b):
+        """Retorna la caixa que engloba completament les dues caixes donades."""
         ax1, ay1, ax2, ay2 = box_a
         bx1, by1, bx2, by2 = box_b
 
@@ -371,32 +374,19 @@ def segment_letters_as_canny_matrices(word_crop_rgb, edges_crop, edges_overlay, 
 
 
 def save_single_character_canny_matrix(edges_crop, matrices_dir, character, image_index, output_size=32):
-    letter_matrix = cv2.resize(
-        edges_crop,
-        (output_size, output_size),
-        interpolation=cv2.INTER_NEAREST
-    )
+    """Funció específica per guardar la matriu Canny d'una imatge EMNIST, on cada imatge ja és un caràcter individual."""
+    letter_matrix = cv2.resize(edges_crop, (output_size, output_size), interpolation=cv2.INTER_NEAREST)
 
     letter_matrix = (letter_matrix > 0).astype(np.uint8)
 
     filename_base = f'{character}_img_{image_index}_matrix'
 
-    cv2.imwrite(
-        os.path.join(matrices_dir, f'{filename_base}.png'),
-        letter_matrix * 255
-    )
-
-    np.save(
-        os.path.join(matrices_dir, f'{filename_base}.npy'),
-        letter_matrix
-    )
+    np.save(os.path.join(matrices_dir, f'{filename_base}.npy'), letter_matrix)
 
     return letter_matrix
 
 
 # ---------------- PIPELINE PRINCIPAL ----------------
-
-#for j in range(min(5, len(paths))):
 total_images = 0
 
 for root, dirs, files in os.walk(PATH):
