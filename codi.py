@@ -3,6 +3,9 @@ import matplotlib.pyplot as plt
 import os
 import json
 import numpy as np
+from skimage import morphology, measure
+import matplotlib.patches as mpatches
+
 
 # ---------------- CONFIGURACIÓ ----------------
 # Fitxer JSON amb rutes relatives d'imatges a processar
@@ -13,11 +16,21 @@ if dataset == 1:
 elif dataset == 2:
     PATH = os.path.join(os.getcwd(), 'Datasets', 'EMNIST', 'train')
     JSON_PATH = os.path.join(os.getcwd(), 'EMNIST.json')
+
+#Elecció del mètode de segmentació
+segmentacio = int(input("1: Segmentació Otsu + Canny o 2: Segmentació amb Adaptive Thresholding + Labels: "))
+
 # Directori on es guardaran les imatges de sortida
-OUTPUT_DIR = os.path.join(os.getcwd(), 'resultats_segmentacio')
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-MATRICES_DIR = os.path.join(OUTPUT_DIR, 'matrius')
-os.makedirs(MATRICES_DIR, exist_ok=True)
+if segmentacio == 1:
+    OUTPUT_DIR = os.path.join(os.getcwd(), 'resultats_segmentacio')
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    MATRICES_DIR = os.path.join(OUTPUT_DIR, 'matrius')
+    os.makedirs(MATRICES_DIR, exist_ok=True)
+else:
+    OUTPUT_DIR = os.path.join(os.getcwd(), 'resultats_segmentacio_labels')
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+
 
 # Carreguem les rutes de les imatges a processar des del JSON
 try:
@@ -428,106 +441,195 @@ for j in range(total_images):
         # Suau difuminat per reduir soroll abans de la binarització
         img_blur = cv2.GaussianBlur(img_clahe, (3, 3), 0)
 
-        # --- 3. BINARITZACIÓ PER OBTENIR MÀSCARA ---
-        # Otsu automàticament tria el llindar; THRESH_BINARY_INV posa el text a 255
-        _, img_bin = cv2.threshold(img_blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        # --- SEGMENTACIÓ OTSU + CANNY ---
+        if segmentacio == 1:
+            
+            # --- 3. BINARITZACIÓ PER OBTENIR MÀSCARA ---
+            # Otsu automàticament tria el llindar; THRESH_BINARY_INV posa el text a 255
+            _, img_bin = cv2.threshold(img_blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
 
-        # --- 4. ELIMINAR LÍNIES HORITZONTALS ---
-        img_no_lines, detected_lines = remove_horizontal_lines(img_bin)
+            # --- 4. ELIMINAR LÍNIES HORITZONTALS ---
+            img_no_lines, detected_lines = remove_horizontal_lines(img_bin)
 
-        # --- 5. MORFOLOGIA SUAU ---
-        # Utilitzem la funció cv2.morphologyEx amb cv2.MORPH_CLOSE per tanca petits forats i unir fragments de caràcters
-        kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))  # Kernel petit per no unir paraules diferents
-        img_morph = cv2.morphologyEx(img_no_lines, cv2.MORPH_CLOSE, kernel_close)
+            # --- 5. MORFOLOGIA SUAU ---
+            # Utilitzem la funció cv2.morphologyEx amb cv2.MORPH_CLOSE per tanca petits forats i unir fragments de caràcters
+            kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))  # Kernel petit per no unir paraules diferents
+            img_morph = cv2.morphologyEx(img_no_lines, cv2.MORPH_CLOSE, kernel_close)
 
-        # --- 6. FILTRAT DE COMPONENTS ---
-        img_filtered = filter_text_components(img_morph)
+            # --- 6. FILTRAT DE COMPONENTS ---
+            img_filtered = filter_text_components(img_morph)
 
-        # Guardem una copia per visualització posterior
-        img_final = img_filtered.copy()
+            # Guardem una copia per visualització posterior
+            img_final = img_filtered.copy()
 
-        # --- 7. CROP DE PARAULA ---
-        if dataset == 1:
-            # Retallem les parts que no ens interessen en el cas de IIIT5K
-            word_crop, mask_crop, img_box, bbox = get_word_crop(img_rgb_big, img_final, padding=5)  # Utilitzem padding=5 per assegurar-nos que no retallem les vores de les lletres
-        else:
-            # Per EMNIST, assumim que cada imatge ja és un sol caràcter, així que no fem crop
-            word_crop = None
-            mask_crop = None
-            img_box = img_rgb_big.copy()
-            bbox = None
+            # --- 7. CROP DE PARAULA ---
+            if dataset == 1:
+                # Retallem les parts que no ens interessen en el cas de IIIT5K
+                word_crop, mask_crop, img_box, bbox = get_word_crop(img_rgb_big, img_final, padding=5)  # Utilitzem padding=5 per assegurar-nos que no retallem les vores de les lletres
+            else:
+                # Per EMNIST, assumim que cada imatge ja és un sol caràcter, així que no fem crop
+                word_crop = None
+                mask_crop = None
+                img_box = img_rgb_big.copy()
+                bbox = None
 
-        # Comprovem si s'ha obtingut un crop vàlid; si no, utilitzem la imatge completa per a les següents etapes
-        if word_crop is None:
-            crop_to_show = img_rgb_big
-            crop_gray = img_gray
-        else:
-            crop_to_show = word_crop
-            crop_gray = cv2.cvtColor(word_crop, cv2.COLOR_RGB2GRAY)
+            # Comprovem si s'ha obtingut un crop vàlid; si no, utilitzem la imatge completa per a les següents etapes
+            if word_crop is None:
+                crop_to_show = img_rgb_big
+                crop_gray = img_gray
+            else:
+                crop_to_show = word_crop
+                crop_gray = cv2.cvtColor(word_crop, cv2.COLOR_RGB2GRAY)
 
-        # --- 8. CANNY SOBRE EL CROP ORIGINAL ---
-        edges_crop = get_canny_edges(crop_gray)
+            # --- 8. CANNY SOBRE EL CROP ORIGINAL ---
+            edges_crop = get_canny_edges(crop_gray)
 
-        # Guardar matriu Canny en el cas EMNIST
-        if dataset == 2:
-            character = os.path.basename(os.path.dirname(paths[j]))
-            save_single_character_canny_matrix(edges_crop, MATRICES_DIR, character, j)
+            # Guardar matriu Canny en el cas EMNIST
+            if dataset == 2:
+                character = os.path.basename(os.path.dirname(paths[j]))
+                save_single_character_canny_matrix(edges_crop, MATRICES_DIR, character, j)
 
-        # --- 9. OVERLAY CANNY SOBRE CROP ---
-        if word_crop is not None:
-            edges_overlay = overlay_edges_on_crop(word_crop, edges_crop)
-        else:
-            edges_overlay = overlay_edges_on_crop(img_rgb_big, edges_crop)
-        
-        # --- 10. SEGMENTACIÓ EN CARÀCTERS AMB PROJECCIÓ VERTICAL ---
-        if dividir:
-            v_proj = None
-            gaps = []
-            char_images = []
-            char_boxes = []
-            edges_connected = None
-            debug_canny_components = None
-            letter_matrices = []
-            letter_boxes = []
-            debug_letters = None
-            connected_edges = None
-
+            # --- 9. OVERLAY CANNY SOBRE CROP ---
             if word_crop is not None:
-                letter_matrices, letter_boxes, debug_letters, connected_edges = segment_letters_as_canny_matrices(word_crop, edges_crop, edges_overlay, OUTPUT_DIR, MATRICES_DIR, j)
-
-
-        # --- Guardem el resultat i visualitzem ---
-        plt.figure(figsize=(16, 8))
-
-        if dividir:
-            if debug_letters is not None:
-                divisio_caracters = debug_letters
+                edges_overlay = overlay_edges_on_crop(word_crop, edges_crop)
             else:
-                raise ValueError("No s'ha pogut generar la imatge de divisió per caràcters (debug_letters és None)")
+                edges_overlay = overlay_edges_on_crop(img_rgb_big, edges_crop)
+            
+            # --- 10. SEGMENTACIÓ EN CARÀCTERS AMB PROJECCIÓ VERTICAL ---
+            if dividir:
+                v_proj = None
+                gaps = []
+                char_images = []
+                char_boxes = []
+                edges_connected = None
+                debug_canny_components = None
+                letter_matrices = []
+                letter_boxes = []
+                debug_letters = None
+                connected_edges = None
 
-        images = [img_rgb_big, img_final, edges_overlay]
-        titles = ['Original escalada', 'Màscara final', 'Canny + Crop']
+                if word_crop is not None:
+                    letter_matrices, letter_boxes, debug_letters, connected_edges = segment_letters_as_canny_matrices(word_crop, edges_crop, edges_overlay, OUTPUT_DIR, MATRICES_DIR, j)
 
-        if dividir:
-            images.append(divisio_caracters)
-            titles.append('Divisió per caràcters')
 
-        for i in range(len(images)):
-            plt.subplot(2, 2, i + 1)
+            # --- Guardem el resultat i visualitzem ---
+            plt.figure(figsize=(16, 8))
 
-            if i == 1:
-                plt.imshow(images[i], cmap='gray')
-            else:
-                plt.imshow(images[i])
+            if dividir:
+                if debug_letters is not None:
+                    divisio_caracters = debug_letters
+                else:
+                    raise ValueError("No s'ha pogut generar la imatge de divisió per caràcters (debug_letters és None)")
 
-            plt.title(titles[i])
-            plt.axis('off')
+            images = [img_rgb_big, img_final, edges_overlay]
+            titles = ['Original escalada', 'Màscara final', 'Canny + Crop']
 
-        plt.tight_layout()
-        plt.savefig(os.path.join(OUTPUT_DIR, f'Resultats_imatge{j}.png'), dpi=200)
-        plt.close('all')
+            if dividir:
+                images.append(divisio_caracters)
+                titles.append('Divisió per caràcters')
 
-        print(f"Imatge {j} processada")
+            for i in range(len(images)):
+                plt.subplot(2, 2, i + 1)
 
+                if i == 1:
+                    plt.imshow(images[i], cmap='gray')
+                else:
+                    plt.imshow(images[i])
+
+                plt.title(titles[i])
+                plt.axis('off')
+
+            plt.tight_layout()
+            plt.savefig(os.path.join(OUTPUT_DIR, f'Resultats_imatge{j}.png'), dpi=200)
+            plt.close('all')
+
+            print(f"Imatge {j} processada")
+        
+        # --- SEGMENTACIÓ ADAPTIVE THRESHOLD + LABELS ---
+        else:
+            img_blur = cv2.GaussianBlur(img_gray, (3, 3), 0)
+
+            # --- 3. BINARITZACIÓ ADAPTATIVA ---
+            at = cv2.adaptiveThreshold(
+                img_blur,
+                255,
+                cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                cv2.THRESH_BINARY_INV,
+                21,
+                4
+            ) > 0
+
+            # Eliminem petits objectes que no siguin lletres
+            at = morphology.remove_small_objects(at, min_size=100)
+
+            # Aplicar morfologia de tancament per unir fragments de les lletres
+            final_image = cv2.morphologyEx(
+                at.astype(np.uint8) * 255,
+                cv2.MORPH_CLOSE,
+                cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3)),
+                iterations=2
+            )
+
+
+            labels = measure.label(final_image, connectivity=2)
+
+            regions = measure.regionprops(labels)
+
+            #Creem la figura per guardar-la i després visualitzar-la
+            fig, ax = plt.subplots(2, 2, figsize=(16, 12))
+            axs = ax[0, 0]
+
+            #Guardem les lletres detectades a l'axis 0 per comparació
+            axs.imshow(img_rgb_big)
+            axs.set_title('Lletras detectades amb Labels')
+
+            for region in regions:
+
+                # Ignorem regions massa petites que probablement són soroll
+                if region.area < 200:
+                    continue
+
+                minr, minc, maxr, maxc = region.bbox
+
+                width = maxc - minc
+                height = maxr - minr
+
+                # Filtrar regions que no semblen lletres basant-nos en dimensions i aspect ratio
+                if width < 5 or height < 10:
+                    continue
+
+                aspect_ratio = width / height
+
+                # Ignorem formes estranyes que no semblen lletres
+                if aspect_ratio > 3 or aspect_ratio < 0.1:
+                    continue
+
+                rect = mpatches.Rectangle(
+                    (minc, minr),
+                    width,
+                    height,
+                    fill=False,
+                    edgecolor='red',
+                    linewidth=2
+                )
+
+                axs.add_patch(rect)
+
+            # Guardem la imatge amb binarització adaptativa a l'axis 1 per comparació
+            ax[0, 1].imshow(at, cmap='gray')
+            ax[0, 1].set_title('Original després de binarització adaptativa')
+
+            # Guardem la imatge final després d'aplicar morfologia a l'axis 2 per comparació
+            ax[1, 0].imshow(final_image, cmap='gray')
+            ax[1, 0].set_title('Imatge després d\'aplicar morfologia')
+
+            for row in ax:
+                for axes in row:
+                    axes.axis('off')
+
+            plt.tight_layout()
+            plt.savefig(os.path.join(OUTPUT_DIR, f'Resultats_imatge{j}.png'), dpi=200)
+            plt.close(fig)
+            
     except Exception as e:
         print(f"Error en {j}: {e}")
