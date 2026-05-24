@@ -47,7 +47,7 @@ def load_canny_dataset(dataset_dir, img_size=32):
 
         img = (img > 0).astype("float32")  # Convertim la matriu a binària: valors > 0 passen a 1, la resta a 0. També es convertim a float32, format adequat per TensorFlow/Keras.
 
-        label = filename[0]  # El primer caràcter del nom del fitxer s'utilitza com a etiqueta. Exemple: 'A' per 'A_img_0_matrix.npy'
+        label = filename[0].upper()  # El primer caràcter del nom del fitxer s'utilitza com a etiqueta. Exemple: 'A' per 'A_img_0_matrix.npy'
 
         images.append(img)
         labels.append(label)
@@ -217,62 +217,86 @@ def preprocess_test_image(image_path, img_size=32):
     return img
 
 
-def test(image_path, model_path="cnn_canny.keras", labels_path="labels.json", img_size=32):
+def test(test_dir, model_path, id_to_class, img_size=32):
     """
-    Prediu quin caràcter hi ha en una matriu Canny.
+    Testa el model en un conjunt de matrius Canny i calcula l'accuracy per caràcter i per paraula.
 
     Paràmetres:
-        image_path (str): ruta de la matriu .npy que es vol classificar.
-        model_path (str): ruta del model entrenat guardat.
-        labels_path (str): ruta del fitxer JSON amb el diccionari id_to_class.
-        img_size (int): mida usada per preprocessar la imatge.
+        test_dir (str): directori on es troben les matrius de test en format .npy. El nom del fitxer ha de seguir el format: caracter_numimatge.npy (ex: A_0.npy).
+        model_path (str): ruta on es troba el model CNN entrenat (ex: "cnn.keras").
+        id_to_class (dict): diccionari que associa identificadors numèrics a caràcters (ex: {0: 'A', 1: 'B', ...}).
+        img_size (int): mida a la qual es redimensionaran les imatges de test (ex: 32 per imatges 32x32).
 
     Retorna:
-        character (str): caràcter predit pel model.
-        confidence (float): probabilitat associada a la predicció.
+        char_accuracy (float): accuracy global per caràcter.
+        word_accuracy (float): accuracy global per paraula, on una paraula es considera correcta només si tots els seus caràcters són correctes.
     """
     model = load_model(model_path)
-    with open(labels_path, "r", encoding="utf-8") as f:
-        labels_data = json.load(f)
 
-    id_to_class = labels_data["id_to_class"]  # Obté el diccionari que converteix IDs numèrics en caràcters.
+    total_chars = 0
+    correct_chars = 0
 
-    img = preprocess_test_image(image_path, img_size)
+    words = {}
 
-    prediction = model.predict(img, verbose=0)[0]  # Calcula la predicció del model, una llista de probabilitats per cada classe
+    for filename in os.listdir(test_dir):
+        if not filename.endswith(".npy"):
+            continue
 
-    class_id = int(np.argmax(prediction))
-    confidence = float(prediction[class_id])  # Guardem la probabilitat associada a la classe escollida.
-    character = id_to_class[str(class_id)]  # Convertim l'identificador de classe al caràcter corresponent
+        name = filename.replace(".npy", "")
 
-    return character, confidence
+        # Format esperat: caracter_numimatge.npy
+        true_char, image_id = name.split("_")
 
+        image_path = os.path.join(test_dir, filename)
 
-def test(image_path, model_path="cnn_canny.keras", labels_path="labels.json", img_size=32):
-    """
-    Prediu quin caràcter hi ha en una matriu Canny.
-    """
+        img = preprocess_test_image(image_path, img_size)
 
-    model = load_model(model_path)
+        prediction = model.predict(img, verbose=0)[0]
+        class_id = int(np.argmax(prediction))
+        predicted_char = id_to_class[class_id]
 
-    with open(labels_path, "r", encoding="utf-8") as f:
-        labels_data = json.load(f)
+        total_chars += 1
 
-    id_to_class = labels_data["id_to_class"]
+        is_correct = predicted_char.upper() == true_char.upper()
 
-    img = preprocess_test_image(image_path, img_size)
+        if is_correct:
+            correct_chars += 1
 
-    prediction = model.predict(img, verbose=0)[0]
-    class_id = int(np.argmax(prediction))
-    confidence = float(prediction[class_id])
+        if image_id not in words:
+            words[image_id] = []
 
-    character = id_to_class[str(class_id)]
+        words[image_id].append(is_correct)
 
-    return character, confidence
+        print(
+            f"{filename} | Real: {true_char} | Predicció: {predicted_char} | Correcte: {is_correct}"
+        )
+
+    char_accuracy = correct_chars / total_chars if total_chars > 0 else 0
+
+    total_words = len(words)
+    correct_words = sum(all(results) for results in words.values())
+
+    word_accuracy = correct_words / total_words if total_words > 0 else 0
+
+    print("\n--- RESULTATS ---")
+    print(f"Caràcters correctes: {correct_chars}/{total_chars}")
+    print(f"Accuracy caràcters: {char_accuracy:.4f}")
+
+    print(f"Paraules correctes: {correct_words}/{total_words}")
+    print(f"Accuracy paraules: {word_accuracy:.4f}")
+
+    return char_accuracy, word_accuracy
 
 
 if __name__ == "__main__":
-    dataset_dir = os.path.join(os.getcwd(), "resultats_segmentacio", "matrius")
+    dataset_dir = os.path.join(os.getcwd(), "resultats_segmentacio", "matrius_emnist")
 
     model, history, acc, class_to_id, id_to_class = training(dataset_dir=dataset_dir)
 
+    test_dir = os.path.join(os.getcwd(), "resultats_segmentacio", "matrius")
+
+    char_acc, word_acc = test(test_dir=test_dir, model_path="cnn.keras", id_to_class=id_to_class)
+
+    print("\n===== RESULTATS FINALS =====")
+    print(f"Accuracy caràcters: {char_acc:.4f}")
+    print(f"Accuracy paraules: {word_acc:.4f}")
