@@ -5,6 +5,7 @@ import json
 import numpy as np
 from scipy.io import loadmat
 
+
 # ---------------- CONFIGURACIÓ ----------------
 # Fitxer JSON amb rutes relatives d'imatges a processar
 dataset = int(input("1: IIIT5K o 2: EMNIST: "))
@@ -51,9 +52,23 @@ except FileNotFoundError:
 
 dividir = dataset == 1  # Només dividim en caràcters per IIIT5K, ja que EMNIST ja són caràcters individuals
 
+errors_segmentacio = 0  # Comptador d'errors de segmentació per a estadístiques finals
+
+
+def nom_matriu_iiit5k(paraula, posicio_caracter, image_index):
+    """Genera el nom de la matriu d'IIIT5K amb format <caracter>_<num_image>.npy."""
+    if paraula is not None and posicio_caracter < len(paraula):
+        caracter = str(paraula[posicio_caracter])
+    else:
+        caracter = f"unknown_{posicio_caracter}"
+
+    # Evitem caràcters problemàtics en noms de fitxer
+    caracter = caracter.replace(os.sep, "_").replace("/", "_").replace("\\", "_")
+
+    return f"{caracter}_{image_index}.npy"
+
 
 # ---------------- FUNCIONS AUXILIARS ----------------
-
 def get_canny_edges(gray_img):
     """
     Detecta les vores usant l'operador Canny amb llindars adaptatius.
@@ -204,7 +219,7 @@ def get_word_crop(original_rgb, mask, padding=5):
     return crop_rgb, crop_mask, boxed, (x1, y1, x2, y2)
 
 
-def overlay_edges_on_crop(crop_rgb, edges):
+def overlay_edges(crop_rgb, edges):
     """
     Dibuixa (pinta) les vores detectades sobre la imatge crop com a píxels vermells.
 
@@ -222,7 +237,7 @@ def overlay_edges_on_crop(crop_rgb, edges):
     return overlay
 
 
-def segment_letters_as_canny_matrices(word_crop_rgb, edges_crop, edges_overlay, output_dir, matrices_dir, image_index, output_size=32, padding=3):
+def segmentacio_canny(word_crop_rgb, edges_crop, edges_overlay, output_dir, matrices_dir, image_index, output_size=32, padding=3, save_outputs=True, paraula=None):
     """
     Segmenta lletres utilitzant només els píxels detectats per Canny.
 
@@ -379,32 +394,22 @@ def segment_letters_as_canny_matrices(word_crop_rgb, edges_crop, edges_overlay, 
         # Crop amb Canny pintat
         letter_overlay = edges_overlay[y1:y2, x1:x2]
 
-        cv2.imwrite(os.path.join(output_dir, f'img_{image_index}_letter_{idx}_canny.png'), cv2.cvtColor(letter_overlay, cv2.COLOR_RGB2BGR))
+        if save_outputs:
+            cv2.imwrite(os.path.join(output_dir, f'img_{image_index}_letter_{idx}_canny.png'), cv2.cvtColor(letter_overlay, cv2.COLOR_RGB2BGR))
 
-        # Guardar la matriu com imatge
-        cv2.imwrite(os.path.join(MATRICES_DIR, f'img_{image_index}_letter_{idx}_matrix.png'), letter_matrix * 255)
+            # Guardar la matriu com imatge
+            cv2.imwrite(os.path.join(matrices_dir, f'img_{image_index}_letter_{idx}_matrix.png'), letter_matrix * 255)
 
-        # Guardar la matriu real com .npy
-        np.save(os.path.join(MATRICES_DIR, f'img_{image_index}_letter_{idx}_matrix.npy'), letter_matrix)
+            # Guardar la matriu real com .npy
+            posicio_caracter = len(letter_matrices) - 1
+            np.save(os.path.join(matrices_dir, nom_matriu_iiit5k(paraula, posicio_caracter, image_index)), letter_matrix)
 
         cv2.rectangle(debug_img, (x1, y1), (x2, y2), (0, 255, 0), 1)
 
     return letter_matrices, letter_boxes, debug_img, connected_edges
 
 
-def save_single_character_canny_matrix(edges_crop, matrices_dir, character, image_index, output_size=32):
-    """Funció específica per guardar la matriu Canny d'una imatge EMNIST, on cada imatge ja és un caràcter individual."""
-    letter_matrix = cv2.resize(edges_crop, (output_size, output_size), interpolation=cv2.INTER_NEAREST)
-
-    letter_matrix = (letter_matrix > 0).astype(np.uint8)
-
-    filename_base = f'{character}_img_{image_index}_matrix'
-
-    np.save(os.path.join(matrices_dir, f'{filename_base}.npy'), letter_matrix)
-
-    return letter_matrix
-
-def segment_letters_by_labels_binary(word_crop_rgb, mask_crop, output_dir, matrices_dir, image_index, output_size=32, padding=3, min_area=200, min_width=5, min_height=10, max_aspect_ratio=3.0, min_aspect_ratio=0.1):
+def segmentacio_labels(word_crop_rgb, mask_crop, output_dir, matrices_dir, image_index, output_size=32, padding=3, min_area=200, min_width=5, min_height=10, max_aspect_ratio=3.0, min_aspect_ratio=0.1, save_outputs=True, paraula=None):
     """
     Segmenta lletres a partir de labels/components connectats, adaptant el mètode del codi 2.
 
@@ -473,6 +478,7 @@ def segment_letters_by_labels_binary(word_crop_rgb, mask_crop, output_dir, matri
     letter_boxes = []
     debug_img = word_crop_rgb.copy()
 
+    # Per cada component acceptat, extraiem la regió corresponent a la màscara original, apliquem padding, i guardem només aquesta regió com a matriu binària 32x32.
     for idx, component in enumerate(components):
         label_id = component["label"]
         x1, y1, x2, y2 = component["box"]
@@ -482,6 +488,7 @@ def segment_letters_by_labels_binary(word_crop_rgb, mask_crop, output_dir, matri
         x2 = min(x2 + padding, W)
         y2 = min(y2 + padding, H)
 
+        # Evitem components massa petits que probablement no són lletres
         if x2 - x1 < 4 or y2 - y1 < 6:
             continue
 
@@ -490,120 +497,27 @@ def segment_letters_by_labels_binary(word_crop_rgb, mask_crop, output_dir, matri
         component_mask[labels == label_id] = 255
 
         letter_mask = component_mask[y1:y2, x1:x2]
-
-        letter_matrix = cv2.resize(
-            letter_mask,
-            (output_size, output_size),
-            interpolation=cv2.INTER_NEAREST
-        )
-
+        letter_matrix = cv2.resize(letter_mask, (output_size, output_size), interpolation=cv2.INTER_NEAREST)
         letter_matrix = (letter_matrix > 0).astype(np.uint8)
 
         letter_matrices.append(letter_matrix)
         letter_boxes.append((x1, y1, x2, y2))
 
-        cv2.imwrite(
-            os.path.join(output_dir, f'img_{image_index}_letter_{idx}_labels.png'),
-            letter_mask
-        )
-
-        cv2.imwrite(
-            os.path.join(matrices_dir, f'img_{image_index}_letter_{idx}_matrix.png'),
-            letter_matrix * 255
-        )
-
-        np.save(
-            os.path.join(matrices_dir, f'img_{image_index}_letter_{idx}_matrix.npy'),
-            letter_matrix
-        )
+        # Guardar resultats si el nombre de components detectats coincideix amb l'esperat
+        if save_outputs:
+            cv2.imwrite(os.path.join(output_dir, f'img_{image_index}_letter_{idx}_labels.png'), letter_mask)
+            cv2.imwrite(os.path.join(matrices_dir, f'img_{image_index}_letter_{idx}_matrix.png'), letter_matrix * 255)
+            posicio_caracter = len(letter_matrices) - 1
+            np.save(os.path.join(matrices_dir, nom_matriu_iiit5k(paraula, posicio_caracter, image_index)), letter_matrix)
 
         cv2.rectangle(debug_img, (x1, y1), (x2, y2), (255, 0, 0), 2)
 
     return letter_matrices, letter_boxes, debug_img, labels
 
 
-def smooth_1d(signal, kernel_size):
-    """Suavitza un vector 1D amb una mitjana mòbil."""
-    kernel_size = max(1, int(kernel_size))
-    if kernel_size <= 1:
-        return signal.astype(np.float32)
-
-    kernel = np.ones(kernel_size, dtype=np.float32) / kernel_size
-    return np.convolve(signal.astype(np.float32), kernel, mode='same')
-
-
-def merge_close_intervals(intervals, max_gap):
-    """Uneix intervals [x1, x2] que estan separats per pocs píxels."""
-    if not intervals:
-        return []
-
-    intervals = sorted(intervals, key=lambda t: t[0])
-    merged = [list(intervals[0])]
-
-    for x1, x2 in intervals[1:]:
-        prev_x1, prev_x2 = merged[-1]
-
-        if x1 - prev_x2 <= max_gap:
-            merged[-1][1] = max(prev_x2, x2)
-        else:
-            merged.append([x1, x2])
-
-    return [(x1, x2) for x1, x2 in merged]
-
-
-def split_wide_intervals(intervals, x_projection, expected_width):
+def segmentacio_finestra_lliscant(mask_crop, output_dir, matrices_dir, image_index, output_size=32, padding=3, smooth_window=7, empty_ratio=0.035, min_char_width_ratio=0.035, max_char_width_ratio=0.16, save_outputs=True, paraula=None):
     """
-    Si una finestra és massa ampla, intenta dividir-la buscant mínims locals
-    de la projecció vertical. Això ajuda quan dues lletres estan enganxades.
-    """
-    if expected_width <= 0:
-        return intervals
-
-    result = []
-
-    for x1, x2 in intervals:
-        width = x2 - x1
-
-        if width <= 1.8 * expected_width:
-            result.append((x1, x2))
-            continue
-
-        segment = x_projection[x1:x2]
-        n_splits = int(round(width / expected_width))
-
-        if n_splits <= 1:
-            result.append((x1, x2))
-            continue
-
-        cut_points = []
-
-        for k in range(1, n_splits):
-            approx = int(k * width / n_splits)
-            search_radius = max(2, int(0.20 * expected_width))
-            left = max(0, approx - search_radius)
-            right = min(len(segment), approx + search_radius + 1)
-
-            if right <= left:
-                continue
-
-            local_min = left + int(np.argmin(segment[left:right]))
-            cut_points.append(x1 + local_min)
-
-        prev = x1
-        for cut in sorted(set(cut_points)):
-            if cut - prev >= 3:
-                result.append((prev, cut))
-            prev = cut
-
-        if x2 - prev >= 3:
-            result.append((prev, x2))
-
-    return result
-
-
-def segment_letters_sliding_window_binary(mask_crop, output_dir, matrices_dir, image_index, output_size=32, padding=3, smooth_window=7, empty_ratio=0.035, min_char_width_ratio=0.035, max_char_width_ratio=0.16):
-    """
-    Segmentació millorada amb finestra lliscant sobre la imatge binària.
+    Segmentació amb finestra lliscant sobre la imatge binària.
     Està pensada per evitar talls interns dins de lletres com O, A, S, N.
     """
 
@@ -612,26 +526,14 @@ def segment_letters_sliding_window_binary(mask_crop, output_dir, matrices_dir, i
     binary = (mask_crop > 0).astype(np.uint8) * 255
 
     # 1. Eliminar línies horitzontals llargues si encara existeixen
-    horizontal_kernel = cv2.getStructuringElement(
-        cv2.MORPH_RECT,
-        (max(20, W // 3), 1)
-    )
+    horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(20, W // 3), 1))
 
-    horizontal_lines = cv2.morphologyEx(
-        binary,
-        cv2.MORPH_OPEN,
-        horizontal_kernel
-    )
+    horizontal_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, horizontal_kernel)
 
     binary = cv2.subtract(binary, horizontal_lines)
 
-    # 2. Neteja suau
-    binary = cv2.morphologyEx(
-        binary,
-        cv2.MORPH_OPEN,
-        cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)),
-        iterations=1
-    )
+    # 2. Neteja morfològica per eliminar soroll i petites connexions que podrien afectar la projecció
+    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)), iterations=1)
 
     binary01 = (binary > 0).astype(np.uint8)
 
@@ -749,66 +651,111 @@ def segment_letters_sliding_window_binary(mask_crop, output_dir, matrices_dir, i
         if x2_local - x1_local < min_char_width:
             continue
 
+        # Busquem les coordenades de tots els píxels dins del segment vertical per trobar el bounding box real de la lletra, evitant així talls que podrien dividir lletres com O, A, S, N
         region = text[:, x1_local:x2_local]
         coords = cv2.findNonZero((region * 255).astype(np.uint8))
 
         if coords is None:
             continue
 
-        x, y, w, h = cv2.boundingRect(coords)
+        x, y, w, h = cv2.boundingRect(coords)  # Coordenades locals dins del crop de la paraula
 
+        # Convertir coordenades locals a coordenades del crop original
         lx1 = max(text_x1 + x1_local + x - padding, 0)
         ly1 = max(y - padding, 0)
         lx2 = min(text_x1 + x1_local + x + w + padding, W)
         ly2 = min(y + h + padding, H)
 
+        # Evitem segments massa petits que probablement no són lletres
         if lx2 - lx1 < 4 or ly2 - ly1 < 6:
             continue
 
+        # Matriu binària de la lletra
         letter_mask = binary[ly1:ly2, lx1:lx2]
-
-        letter_matrix = cv2.resize(
-            letter_mask,
-            (output_size, output_size),
-            interpolation=cv2.INTER_NEAREST
-        )
-
+        letter_matrix = cv2.resize(letter_mask, (output_size, output_size), interpolation=cv2.INTER_NEAREST)
         letter_matrix = (letter_matrix > 0).astype(np.uint8)
 
         letter_matrices.append(letter_matrix)
         letter_boxes.append((lx1, ly1, lx2, ly2))
 
-        cv2.imwrite(
-            os.path.join(output_dir, f'img_{image_index}_letter_{i}_sliding_binary.png'),
-            letter_mask
-        )
+        # Guardar resultats si el nombre de segments detectats coincideix amb l'esperat
+        if save_outputs:
+            cv2.imwrite(os.path.join(output_dir, f'img_{image_index}_letter_{i}_sliding_binary.png'), letter_mask)
+            cv2.imwrite(os.path.join(matrices_dir, f'img_{image_index}_letter_{i}_matrix.png'), letter_matrix * 255)
+            posicio_caracter = len(letter_matrices) - 1
+            np.save(os.path.join(matrices_dir, nom_matriu_iiit5k(paraula, posicio_caracter, image_index)), letter_matrix)
 
-        cv2.imwrite(
-            os.path.join(matrices_dir, f'img_{image_index}_letter_{i}_matrix.png'),
-            letter_matrix * 255
-        )
-
-        np.save(
-            os.path.join(matrices_dir, f'img_{image_index}_letter_{i}_matrix.npy'),
-            letter_matrix
-        )
-
+        # Dibuixem caixa sobre la imatge
         cv2.rectangle(debug_img, (lx1, ly1), (lx2, ly2), (0, 255, 0), 2)
 
     return letter_matrices, letter_boxes, debug_img, smooth
 
 
-def save_single_character_matrix(mask_crop, matrices_dir, character, image_index, output_size=32):
-    """Per EMNIST: guarda directament la màscara com a matriu 32x32."""
-    letter_matrix = cv2.resize(mask_crop, (output_size, output_size), interpolation=cv2.INTER_NEAREST)
+def provar_segmentacions(word_crop, mask_crop, edges_crop, edges_overlay, output_dir, matrices_dir, image_index, expected_len, paraula):
+    """
+    Prova els tres mètodes de segmentació.
+    Ordre:
+    1. Labels / components connectats sobre binària
+    2. Canny + components connectats
+    3. Projecció + finestra lliscant
+
+    Només guarda els PNG i les matrius quan el nombre de segments detectats
+    coincideix amb la longitud esperada de la paraula.
+    """
+    global errors_segmentacio
+
+    metodes = [
+        (
+            "Labels sobre imatge binària",
+            lambda save_outputs: segmentacio_labels(word_crop, mask_crop, output_dir, matrices_dir, image_index, min_area=200, min_width=5, min_height=10, max_aspect_ratio=3.0, min_aspect_ratio=0.1, save_outputs=save_outputs, paraula=paraula)
+        ),
+        (
+            "Canny + components connectats",
+            lambda save_outputs: segmentacio_canny(word_crop, edges_crop, edges_overlay, output_dir, matrices_dir, image_index, save_outputs=save_outputs, paraula=paraula)
+        ),
+        (
+            "Projecció + finestra lliscant",
+            lambda save_outputs: segmentacio_finestra_lliscant(mask_crop, output_dir, matrices_dir, image_index, save_outputs=save_outputs, paraula=paraula)
+        )
+    ]
+
+    for nom_metode, funcio_segmentacio in metodes:
+        # Primer provem el mètode sense guardar fitxers
+        letter_matrices, letter_boxes, debug_letters, extra = funcio_segmentacio(False)
+
+        if len(letter_boxes) == expected_len:
+            # Si el resultat és correcte, repetim el mètode guardant PNG i matrius
+            letter_matrices, letter_boxes, debug_letters, extra = funcio_segmentacio(True)
+
+            print(
+                f"Imatge {image_index}: segmentació correcta amb {nom_metode} "
+                f"({len(letter_boxes)}/{expected_len})"
+            )
+
+            return letter_matrices, letter_boxes, debug_letters, nom_metode
+
+        print(
+            f"Imatge {image_index}: {nom_metode} no coincideix "
+            f"({len(letter_boxes)}/{expected_len})"
+        )
+
+    print("No s'ha pogut segmentar correctament la paraula.")
+    errors_segmentacio += 1
+    return [], [], None, None
+
+
+def guardar_matrius_un_sol_caracter(edges_crop, matrices_dir, character, image_index, output_size=32):
+    """Funció específica per guardar la matriu Canny d'una imatge EMNIST, on cada imatge ja és un caràcter individual."""
+    letter_matrix = cv2.resize(edges_crop, (output_size, output_size), interpolation=cv2.INTER_NEAREST)
     letter_matrix = (letter_matrix > 0).astype(np.uint8)
     filename_base = f'{character}_img_{image_index}_matrix'
     np.save(os.path.join(matrices_dir, f'{filename_base}.npy'), letter_matrix)
-    cv2.imwrite(os.path.join(matrices_dir, f'{filename_base}.png'), letter_matrix * 255)
+
     return letter_matrix
 
 
 # ---------------- PIPELINE PRINCIPAL ----------------
+"""
 total_images = 0
 
 for root, dirs, files in os.walk(PATH):
@@ -820,8 +767,9 @@ for root, dirs, files in os.walk(PATH):
     total_images += len(image_files)
 
 print(f"Total d'imatges: {total_images}")
+"""
 
-for j in range(total_images):
+for j in range(150):
     image_path = os.path.join(PATH, paths[j])
 
     try:
@@ -893,43 +841,38 @@ for j in range(total_images):
         # Guardar matriu Canny en el cas EMNIST
         if dataset == 2:
             character = os.path.basename(os.path.dirname(paths[j]))
-            save_single_character_canny_matrix(edges_crop, MATRICES_DIR, character, j)
+            guardar_matrius_un_sol_caracter(edges_crop, MATRICES_DIR, character, j)
+
+            print(f"Imatge {j} processada. Matriu Canny guardada.")
+            continue
 
         # --- 9. OVERLAY CANNY SOBRE CROP ---
         if word_crop is not None:
-            edges_overlay = overlay_edges_on_crop(word_crop, edges_crop)
+            edges_overlay = overlay_edges(word_crop, edges_crop)
         else:
-            edges_overlay = overlay_edges_on_crop(img_rgb_big, edges_crop)
+            edges_overlay = overlay_edges(img_rgb_big, edges_crop)
 
         # --- 10. SEGMENTACIÓ EN CARÀCTERS ---
         if dividir:
             letter_matrices = []
             letter_boxes = []
             debug_letters = None
-            connected_edges = None
+            metode_utilitzat = None
 
             if word_crop is not None:
-                metode_segmentacio = int(input("Tria el mètode de segmentació (1: Canny + components connectats, 2: labels sobre binària, 3: projecció + finestra lliscant): "))
-                if metode_segmentacio == 1:
-                    # Mètode del primer fitxer: Canny + components connectats
-                    letter_matrices, letter_boxes, debug_letters, connected_edges = segment_letters_as_canny_matrices(
-                        word_crop, edges_crop, edges_overlay, OUTPUT_DIR, MATRICES_DIR, j
-                    )
-                elif metode_segmentacio == 2:
-                    # Mètode del segon fitxer: labels / components connectats sobre la màscara binària
-                    letter_matrices, letter_boxes, debug_letters, labels = segment_letters_by_labels_binary(
-                        word_crop, mask_crop, OUTPUT_DIR, MATRICES_DIR, j,
-                        min_area=200,
-                        min_width=5,
-                        min_height=10,
-                        max_aspect_ratio=3.0,
-                        min_aspect_ratio=0.1
-                    )
-                elif metode_segmentacio == 3:
-                    # Mètode del tercer fitxer: projecció/finestra lliscant sobre la màscara binària
-                    letter_matrices, letter_boxes, debug_letters, projection = segment_letters_sliding_window_binary(mask_crop, OUTPUT_DIR, MATRICES_DIR, j)
-                else:
-                    raise ValueError("Mètode de segmentació no vàlid. Escriu 1, 2 o 3.")
+                image_name = os.path.basename(paths[j])
+                paraula = iiit_labels.get(image_name, "")
+                expected_len = len(paraula)
+
+                if expected_len == 0:
+                    print(f"No s'ha trobat l'etiqueta de la imatge: {image_name}")
+                    continue
+
+                letter_matrices, letter_boxes, debug_letters, metode_utilitzat = provar_segmentacions(word_crop, mask_crop, edges_crop, edges_overlay, OUTPUT_DIR, MATRICES_DIR, j, expected_len, paraula)
+
+                if debug_letters is None:
+                    print(f"No s'ha pogut segmentar correctament la paraula: {paraula}")
+                    continue
 
 
         # --- Guardem el resultat i visualitzem ---
@@ -967,3 +910,7 @@ for j in range(total_images):
 
     except Exception as e:
         print(f"Error en {j}: {e}")
+
+
+print(f"Processament completat.")
+print(f"Errors de segmentació: {errors_segmentacio}.")
